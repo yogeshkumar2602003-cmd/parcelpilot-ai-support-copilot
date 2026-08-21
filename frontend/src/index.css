@@ -1,0 +1,24 @@
+@import "tailwindcss";
+
+html, body, #root {
+  height: 100%;
+}
+
+body {
+  background-color: #f4f5f7;
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-thumb {
+  background-color: #cbd2d9;
+  border-radius: 4px;
+}
+
+.markdown-body p { margin: 0 0 0.5em 0; }
+.markdown-body p:last-child { margin-bottom: 0; }
+.markdown-body ul, .markdown-body ol { margin: 0.25em 0 0.5em 1.25em; }
+.markdown-body strong { font-weight: 600; }
+.markdown-body code { background: rgba(0,0,0,0.06); padding: 0 4px; border-radius: 3px; font-size: 0.85em; }
