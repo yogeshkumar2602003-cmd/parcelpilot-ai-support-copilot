@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sqlite3
 import time
 import uuid
@@ -56,6 +57,14 @@ SOURCE AUTHORITY RULES (critical -- follow exactly):
 8. Do not invent procedures, capabilities, or numbers not present in the retrieved sources. If a request needs
    a capability this system doesn't have (e.g. updating a billing contact), say so plainly and offer to escalate
    or hand off to a human rather than inventing steps.
+9. GROUNDING (critical): before this message, the system already ran a document search and any relevant
+   ticket/order/account lookup for you -- their results are the `tool_result` turns immediately above. Base your
+   answer on THAT retrieved evidence (and any further tool calls you make), never on this system prompt's own
+   summaries (e.g. rule 7 above is background context for you, not a substitute for citing the Product
+   Operations Guide/KI-211 yourself when it's relevant) or on general background knowledge. If those results are
+   empty or don't address the question, call more tools (a different query, doc_type, or a get_*/search_* tool)
+   before answering; if you still find nothing relevant after that, say plainly that you don't have evidence for
+   it rather than guessing -- never present an unsourced guess as fact.
 
 TOOLS: use search_documents for policy/SOP/agreement text, the get_*/search_* tools for structured account/
 order/ticket facts (always account-scoped automatically), the calculate_* tools for all arithmetic, and
@@ -94,6 +103,42 @@ def _tool_result_message(tool_use_id: str, result: dict[str, Any]) -> dict[str, 
     return {"type": "tool_result", "tool_use_id": tool_use_id, "content": json.dumps(result, default=str)}
 
 
+_RECORD_ID_PATTERNS: list[tuple[str, str]] = [
+    ("get_ticket", r"\bTKT-\d+\b"),
+    ("get_order", r"\bORD-\d+\b"),
+    ("get_account", r"\bACCT-\d+\b"),
+]
+
+
+def _auto_retrieval_calls(user_message: str) -> list[tuple[str, dict[str, Any]]]:
+    """Evidence this turn always retrieves BEFORE the model's first
+    generation, regardless of whether the model itself would have chosen to
+    call a retrieval tool. This is what makes grounding deterministic
+    rather than dependent on a given model's tool-use reliability (small
+    local models in particular can and do answer directly from the system
+    prompt's own text, or from parametric knowledge, without calling
+    anything).
+
+    Always searches the document corpus with the raw user message as the
+    query (cheap -- BM25 over a local index, no LLM call), plus a direct
+    structured lookup for any ticket/order/account id literally named in
+    the message, since those are record-specific questions the document
+    corpus can't answer.
+    """
+    calls: list[tuple[str, dict[str, Any]]] = [("search_documents", {"query": user_message})]
+    seen: set[tuple[str, str]] = set()
+    for tool_name, pattern in _RECORD_ID_PATTERNS:
+        for match in re.finditer(pattern, user_message, re.IGNORECASE):
+            record_id = match.group(0).upper()
+            key = (tool_name, record_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            arg_name = {"get_ticket": "ticket_id", "get_order": "order_id", "get_account": "account_id"}[tool_name]
+            calls.append((tool_name, {arg_name: record_id}))
+    return calls
+
+
 def _dedupe_evidence(evidence: list[Evidence]) -> list[Evidence]:
     seen = set()
     out = []
@@ -116,6 +161,27 @@ def run_agent_turn(
 
     messages: list[dict[str, Any]] = list(history or [])
     messages.append({"role": "user", "content": user_message})
+
+    # Deterministic grounding: retrieve evidence for THIS turn before the
+    # model generates anything, as synthetic tool_use/tool_result turns the
+    # model then sees as if it had already searched. Runs every turn (not
+    # just the first) so evidence stays current as the conversation moves
+    # from topic to topic. See `_auto_retrieval_calls`.
+    auto_calls = _auto_retrieval_calls(user_message)
+    if auto_calls:
+        assistant_blocks = []
+        tool_result_blocks = []
+        for tool_name, tool_input in auto_calls:
+            call_id = f"auto_{uuid.uuid4().hex[:10]}"
+            assistant_blocks.append({"type": "tool_use", "id": call_id, "name": tool_name, "input": tool_input})
+            result = executor.execute(tool_name, tool_input)
+            tool_result_blocks.append(_tool_result_message(call_id, result))
+            logger.info(
+                "auto_retrieval request_id=%s user=%s tool=%s ok=%s",
+                request_id, principal.user_id, tool_name, "error" not in result,
+            )
+        messages.append({"role": "assistant", "content": assistant_blocks})
+        messages.append({"role": "user", "content": tool_result_blocks})
 
     final_text = ""
     depth_exceeded = False

@@ -41,10 +41,10 @@ def evidence_label(file_name: str, section: str | None) -> str:
 
 
 def make_evidence(file_name: str, section: str | None, authority_category: str, status: str,
-                   detail: str | None = None) -> Evidence:
+                   detail: str | None = None, page: int | None = None) -> Evidence:
     return Evidence(
         label=evidence_label(file_name, section), source_file=file_name, section=section,
-        page=None, authority_category=authority_category, status=status, detail=detail,
+        page=page, authority_category=authority_category, status=status, detail=detail,
     )
 
 

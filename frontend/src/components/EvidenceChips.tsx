@@ -16,6 +16,7 @@ export default function EvidenceChips({ evidence }: { evidence: Evidence[] }) {
           className={`inline-flex items-center rounded-md px-2 py-0.5 text-[11px] font-medium ring-1 ring-inset ${STATUS_STYLE[e.status] || STATUS_STYLE.current}`}
         >
           {e.label}
+          {e.page != null && <span className="ml-1 opacity-70">p.{e.page}</span>}
           {e.status === "historical_only" && <span className="ml-1 opacity-70">(historical)</span>}
         </span>
       ))}

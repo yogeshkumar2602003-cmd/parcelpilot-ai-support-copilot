@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from app.actions.pending_actions import ActionAuthorizationError, propose_action
-from app.agent.evidence import ConfidenceTracker, evidence_label, make_evidence
+from app.agent.evidence import ConfidenceTracker, make_evidence
 from app.domain.authority import resolve_cancellation_rule, resolve_service_credit_rule, resolve_support_sla
 from app.domain.calculations import evaluate_cancellation, evaluate_service_credit, evaluate_ticket_sla
 from app.domain.conflicts import detect_historical_conflict
@@ -21,6 +21,18 @@ from app.domain.models import Evidence, Principal
 from app.domain.repositories import AuthorizationError, NotFoundError, Repositories
 from app.domain.snapshot import get_snapshot
 from app.retrieval.retriever import get_index
+
+# BM25 (rank-bm25) scores are unbounded and scale with query length/term
+# rarity, not a normalized 0-1 relevance probability -- so this floor was
+# calibrated empirically against this corpus, not derived analytically.
+# Genuinely on-topic queries against these documents scored 6.4-11.7 for
+# their top hit; genuinely off-topic queries (weather, capitals, unrelated
+# HR policy) scored 1.5-3.5. 4.0 sits in the gap. Below it, a query merely
+# shares a few common words with some chunk (e.g. "policy", "customer")
+# without actually being answered by it -- treating that as "no relevant
+# evidence" (rather than citing it anyway) is what stops the agent from
+# presenting noise as if it were a sourced answer.
+MIN_RELEVANT_SCORE = 4.0
 
 TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
@@ -235,20 +247,42 @@ class ToolExecutor:
         include_historical = bool(inp.get("include_historical")) and self.principal.is_internal()
         results = get_index().search(
             self.principal, inp.get("query", ""), doc_type=inp.get("doc_type"),
-            include_historical=include_historical, top_k=5,
+            include_historical=include_historical, top_k=3,
         )
         if not results:
             return {"results": [], "message": "No accessible documents matched this query."}
+        if results[0].score < MIN_RELEVANT_SCORE:
+            # The best match found shares too little with the query to
+            # count as an actual answer to it (see MIN_RELEVANT_SCORE) --
+            # deliberately NOT counted as evidence (no note_evidence_used,
+            # nothing appended to self.evidence), so confidence correctly
+            # stays Low and the agent is told plainly to say it doesn't
+            # know rather than cite these as if they were on-topic.
+            return {
+                "results": [],
+                "message": (
+                    "No sufficiently relevant documents matched this query -- the closest matches shared too "
+                    "little with it to count as an answer. Do not cite or rely on them; tell the user this "
+                    "system doesn't have sourced information on this rather than guessing."
+                ),
+            }
         out = []
         for r in results:
             self.confidence.note_evidence_used()
-            self.evidence.append(make_evidence(r.file_name, r.section, r.authority_category, r.status))
+            self.evidence.append(make_evidence(r.file_name, r.section, r.authority_category, r.status, page=r.page))
+            # Kept deliberately lean (vs. the full SearchResult) -- this
+            # goes straight into the LLM's prompt, and on constrained/local
+            # hardware every extra token here is directly extra latency.
+            # `label`/effective_date/updated_date/relevance_score aren't
+            # needed for the model to ground and cite an answer; the
+            # full-fidelity data still reaches the API response via
+            # `self.evidence` above regardless of what's sent to the model
+            # here. `customer_scope` is kept -- cheap, and access-control
+            # verification (tests, audits) depends on it being visible on
+            # the actual tool result, not just derived server-side.
             out.append({
-                "label": evidence_label(r.file_name, r.section),
-                "file_name": r.file_name, "doc_type": r.doc_type, "status": r.status,
-                "authority_category": r.authority_category, "effective_date": r.effective_date,
-                "updated_date": r.updated_date, "customer_scope": r.customer_scope,
-                "section": r.section, "page": r.page, "text": r.text, "relevance_score": round(r.score, 3),
+                "file_name": r.file_name, "status": r.status, "authority_category": r.authority_category,
+                "section": r.section, "page": r.page, "customer_scope": r.customer_scope, "text": r.text,
             })
         return {"results": out}
 
