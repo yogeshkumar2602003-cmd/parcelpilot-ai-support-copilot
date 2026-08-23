@@ -10,6 +10,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from app import config
+from app.agent.llm_client import check_ollama_reachable
 from app.api import actions, chat, misc
 from app.config import CORS_ORIGINS, DATA_DIR, LOG_LEVEL
 from app.db import get_singleton_connection, init_schema
@@ -53,17 +54,31 @@ def health():
     # prefix/suffix of it. The chat agent being unconfigured is not itself
     # an unhealthy state: ingestion, calculations, and Issue Radar all work
     # without it, so this never affects the response status code.
+    # `ai_reachable` is a lightweight connectivity probe (Ollama: list
+    # locally installed models; Anthropic: mirrors ai_configured -- a real
+    # reachability check would cost money on every /health poll), never a
+    # full inference call.
+    if config.settings.ai_provider == "ollama":
+        ai_reachable = check_ollama_reachable(config.settings.ollama_base_url, config.settings.ollama_model)
+    else:
+        ai_reachable = config.settings.ai_configured
+    ai_fields = {
+        "ai_configured": config.settings.ai_configured,
+        "ai_provider": config.settings.ai_provider,
+        "ai_model": config.settings.active_ai_model,
+        "ai_reachable": ai_reachable,
+    }
     try:
         conn = get_singleton_connection()
         counts = {
             t: conn.execute(f"SELECT COUNT(*) c FROM {t}").fetchone()["c"]
             for t in ("accounts", "orders", "tickets", "document_chunks")
         }
-        return {"status": "ok", "ai_configured": config.settings.ai_configured, "counts": counts}
+        return {"status": "ok", **ai_fields, "counts": counts}
     except Exception as e:
         return JSONResponse(
             status_code=503,
-            content={"status": "error", "ai_configured": config.settings.ai_configured, "detail": str(e)},
+            content={"status": "error", **ai_fields, "detail": str(e)},
         )
 
 

@@ -5,10 +5,21 @@ import sqlite3
 import uuid
 from typing import Any
 
+import anthropic
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
-from app.agent.llm_client import AnthropicLLMClient, NoAPIKeyError
+from app import config
+from app.agent.llm_client import (
+    AnthropicLLMClient,
+    LLMClient,
+    NoAPIKeyError,
+    OllamaLLMClient,
+    OllamaModelNotFoundError,
+    OllamaResponseError,
+    OllamaTimeoutError,
+    OllamaUnavailableError,
+)
 from app.agent.orchestrator import run_agent_turn
 from app.api.deps import get_conn, get_principal, new_request_id
 from app.domain.models import AgentAnswer, Principal
@@ -32,6 +43,17 @@ class ChatResponse(BaseModel):
     answer: AgentAnswer
 
 
+def _build_llm_client() -> LLMClient:
+    """Select the LLM backend per `config.settings.ai_provider`. Referencing
+    `AnthropicLLMClient`/`OllamaLLMClient` as this module's own global names
+    (rather than a factory living in `app.agent.llm_client`) is deliberate:
+    tests patch `app.api.chat.AnthropicLLMClient` directly, and that only
+    works if the lookup happens in this module's namespace."""
+    if config.settings.ai_provider == "ollama":
+        return OllamaLLMClient()
+    return AnthropicLLMClient()
+
+
 @router.post("", response_model=ChatResponse)
 def chat(
     body: ChatRequest, request: Request,
@@ -46,13 +68,44 @@ def chat(
     _SESSION_OWNER[session_id] = principal.user_id
     history = _SESSIONS.get(session_id, [])
 
-    llm = AnthropicLLMClient()
+    llm = _build_llm_client()
     try:
         result = run_agent_turn(conn, principal, llm, body.message, history=history, request_id=request_id)
     except NoAPIKeyError as e:
         # Structured, non-secret configuration error -- never includes the
         # key itself (NoAPIKeyError's message only ever names the env var).
         raise HTTPException(status_code=503, detail={"error": "ai_not_configured", "message": str(e)})
+    except OllamaUnavailableError as e:
+        logger.exception("ollama unavailable request_id=%s", request_id)
+        raise HTTPException(status_code=503, detail={"error": "ai_unavailable", "message": str(e)})
+    except OllamaModelNotFoundError as e:
+        logger.exception("ollama model missing request_id=%s", request_id)
+        raise HTTPException(status_code=503, detail={"error": "ai_model_missing", "message": str(e)})
+    except OllamaTimeoutError as e:
+        logger.exception("ollama timeout request_id=%s", request_id)
+        raise HTTPException(status_code=504, detail={"error": "ai_timeout", "message": str(e)})
+    except OllamaResponseError:
+        logger.exception("ollama response error request_id=%s", request_id)
+        raise HTTPException(
+            status_code=502,
+            detail={"error": "ai_provider_error", "message": "The local AI model returned an unexpected response."},
+        )
+    except anthropic.APIError:
+        # Covers billing/credit failures, auth errors, rate limits, and
+        # connectivity problems talking to api.anthropic.com. Never forward
+        # the SDK exception's raw text to the client -- it can include
+        # request ids / account-identifying details -- only a fixed, safe
+        # message. Full detail goes to the server log only.
+        logger.exception("anthropic api error request_id=%s", request_id)
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "error": "ai_provider_error",
+                "message": "The AI provider (Anthropic) rejected the request. This is often a billing/credit or "
+                "API key issue -- check the server logs and your Anthropic account, or switch AI_PROVIDER=ollama "
+                "for local/free mode.",
+            },
+        )
     except Exception:
         logger.exception("agent turn failed request_id=%s", request_id)
         raise HTTPException(status_code=500, detail="The agent encountered an internal error processing this request.")

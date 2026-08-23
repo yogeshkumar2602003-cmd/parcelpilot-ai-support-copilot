@@ -86,6 +86,12 @@ class Settings:
 
     anthropic_api_key: str
     anthropic_model: str
+    ai_provider: str
+    ollama_base_url: str
+    ollama_model: str
+    ollama_timeout_s: float
+    ollama_num_predict: int
+    ollama_keep_alive: str
     db_path: Path
     max_tool_call_depth: int
     business_hours_start: int
@@ -95,14 +101,23 @@ class Settings:
 
     @property
     def ai_configured(self) -> bool:
-        """True if a (non-empty) Anthropic API key is configured. Safe to
+        """True if a (non-empty) Anthropic API key is configured. Kept
+        specifically about the Anthropic key (unrelated to `ai_provider`)
+        for backward compatibility with existing callers/tests. Safe to
         expose to clients (e.g. via /health) -- never derive a boolean from
         the key's value in a way that could leak length/prefix/etc."""
         return bool(self.anthropic_api_key)
 
+    @property
+    def active_ai_model(self) -> str:
+        """The model id actually in use for the currently selected
+        `ai_provider` -- what `/health` should display."""
+        return self.ollama_model if self.ai_provider == "ollama" else self.anthropic_model
+
     def __repr__(self) -> str:  # never let a stray print()/log/debugger leak the key
         return (
-            f"Settings(ai_configured={self.ai_configured}, anthropic_model={self.anthropic_model!r}, "
+            f"Settings(ai_configured={self.ai_configured}, ai_provider={self.ai_provider!r}, "
+            f"anthropic_model={self.anthropic_model!r}, ollama_model={self.ollama_model!r}, "
             f"db_path={str(self.db_path)!r}, max_tool_call_depth={self.max_tool_call_depth}, "
             f"log_level={self.log_level!r})"
         )
@@ -110,11 +125,55 @@ class Settings:
     __str__ = __repr__
 
 
+_LOCAL_HOSTS = {"localhost", "127.0.0.1", "[::1]"}
+
+
 def load_settings() -> Settings:
-    """Build a Settings instance from the current process environment."""
+    """Build a Settings instance from the current process environment.
+
+    `AI_PROVIDER` selects which LLM backend `app.api.chat` talks to: "ollama"
+    (the default for this repo's `.env` -- a local, zero-cost model, no
+    Anthropic key required) or "anthropic" (the original paid cloud path,
+    still fully supported -- e.g. for CI/tests/production, which pin it
+    explicitly). The code-level fallback here is deliberately "anthropic",
+    not "ollama": it's what every pre-existing caller/test that never sets
+    AI_PROVIDER at all was already written to assume, so an *absent* env var
+    reproduces the original behavior exactly. This machine's `.env` sets
+    AI_PROVIDER=ollama explicitly to opt into local mode.
+    """
+    ai_provider = os.getenv("AI_PROVIDER", "anthropic").strip().lower()
+    if ai_provider not in ("anthropic", "ollama"):
+        logger.warning("Unknown AI_PROVIDER=%r; falling back to 'anthropic'.", ai_provider)
+        ai_provider = "anthropic"
+
+    ollama_base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").strip().rstrip("/")
+    if ai_provider == "ollama":
+        host = ollama_base_url.split("://", 1)[-1].split("/", 1)[0].split(":", 1)[0]
+        if host not in _LOCAL_HOSTS:
+            # Not a hard error -- some setups do run Ollama on a separate
+            # trusted host -- but this must never be able to be
+            # api.anthropic.com, so it's loud in the logs either way.
+            logger.warning(
+                "AI_PROVIDER=ollama but OLLAMA_BASE_URL=%r is not localhost. Verify this is intentional.",
+                ollama_base_url,
+            )
+
     return Settings(
         anthropic_api_key=os.getenv("ANTHROPIC_API_KEY", "").strip(),
         anthropic_model=os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-5-20250929").strip(),
+        ai_provider=ai_provider,
+        ollama_base_url=ollama_base_url,
+        ollama_model=os.getenv("AI_MODEL", "qwen2.5:1.5b").strip(),
+        ollama_timeout_s=float(os.getenv("OLLAMA_TIMEOUT_S", "180")),
+        # Concise answers are the system prompt's own instruction, so capping
+        # generation length trims the worst-case tail without changing
+        # typical output; a runaway generation is the main thing this guards
+        # against on slow hardware.
+        ollama_num_predict=int(os.getenv("OLLAMA_NUM_PREDICT", "512")),
+        # How long Ollama keeps the model loaded in RAM after a request.
+        # Longer avoids paying the ~15s+ reload cost on every chat message;
+        # only worth shortening if RAM is needed for other apps between uses.
+        ollama_keep_alive=os.getenv("OLLAMA_KEEP_ALIVE", "30m").strip(),
         db_path=Path(os.getenv("PARCELPILOT_DB_PATH", str(BACKEND_DIR / "parcelpilot.db"))),
         max_tool_call_depth=int(os.getenv("PARCELPILOT_MAX_TOOL_DEPTH", "8")),
         business_hours_start=int(os.getenv("PARCELPILOT_BUSINESS_HOURS_START", "9")),
@@ -138,11 +197,17 @@ def reload_settings() -> Settings:
     """
     global settings
     settings = load_settings()
-    logger.info("Anthropic configured: %s (model=%s)", settings.ai_configured, settings.anthropic_model)
+    logger.info(
+        "AI provider=%s active_model=%s (anthropic_configured=%s)",
+        settings.ai_provider, settings.active_ai_model, settings.ai_configured,
+    )
     return settings
 
 
-logger.info("Anthropic configured: %s (model=%s)", settings.ai_configured, settings.anthropic_model)
+logger.info(
+        "AI provider=%s active_model=%s (anthropic_configured=%s)",
+        settings.ai_provider, settings.active_ai_model, settings.ai_configured,
+    )
 
 # --- Backward-compatible flat constants -------------------------------
 # These mirror `settings` for modules that only ever need the value fixed
